@@ -52,7 +52,7 @@ and you know how to decode payload sent from a device and how to send a downlink
 
 ## Usage
 
-In *Active mode* the application every 60 seconds sends to IoT Creators platform basic sensors readings.
+In *Active mode* the application every 5 minutes sends to IoT Creators platform basic sensors readings.
 
 ```JSON
 {"Temp":21.98,"Press":1.0116,"Humid":39.99,"Gas":13086,"Vbat":4371}
