@@ -10,10 +10,6 @@ config UDP_DATA_UPLOAD_FREQUENCY_SECONDS
 	int "How often data is transmitted to the server"
 	default 900
 
-config UDP_DATA_DOWNLOAD_FREQUENCY_SECONDS
-	int "How often data is polled from the server"
-	default 900
-
 config UDP_SERVER_ADDRESS_STATIC
 	string "UDP server IP address"
 	default "8.8.8.8"
@@ -32,6 +28,12 @@ config UDP_EDRX_ENABLE
 config UDP_RAI_ENABLE
 	bool "Enable LTE Release Assistance Indication"
 
+endmenu
+
+menu "GPIO Settings"
+config GPIO_POLL_FREQUENCY_SECONDS
+	int "How often data are polled from GPIO Expander"
+	default 5
 endmenu
 
 menu "Sensor UI Module"

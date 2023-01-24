@@ -6,12 +6,13 @@
 
 #include <zephyr.h>
 #include <stdio.h>
-#include <modem/lte_lc.h> 		// LTE link control
-#include <nrf_modem_at.h>		// includes AT command handling
-#include <modem/modem_info.h> 	// includes modem info module
-#include <net/socket.h>			// includes TCP/IP socket handling
-#include <device.h> 			// Zephyr device API
-#include <drivers/sensor.h> 	// Zephyr sensor driver API
+#include <modem/lte_lc.h>	  // LTE link control
+#include <nrf_modem_at.h>	  // includes AT command handling
+#include <modem/modem_info.h> // includes modem info module
+#include <net/socket.h>		  // includes TCP/IP socket handling
+#include <device.h>			  // Zephyr device API
+#include <drivers/sensor.h>	  // Zephyr sensor driver API
+#include <drivers/gpio.h>
 
 /* UI drivers for Thingy:91 */
 #include "buzzer.h"
@@ -29,6 +30,13 @@ const struct device *bme_680;
 struct sensor_value temp, press, humidity, gas_res;
 float pressure;
 
+/* GPIO */
+const struct device *sx1509b_dev;
+
+#define GPIO_PIN_OPEN_ENDSTOP 15
+#define GPIO_PIN_CLOSED_ENDSTOP 14
+#define GPIO_PIN_RELAY 13
+
 /* UDP Socket */
 static int client_fd;
 static bool socket_open = false;
@@ -37,14 +45,46 @@ static struct sockaddr_storage host_addr;
 /* Workqueues */
 static struct k_work_delayable server_transmission_work;
 static struct k_work_delayable data_fetch_work;
-static struct k_work_delayable poll_data_work;
+static struct k_work_delayable data_poll_work;
+static struct k_work_delayable gpio_fetch_work;
+
+/* Garage Door state */
+#define GARAGE_DOOR_OPENING 1
+#define GARAGE_DOOR_OPEN 2
+#define GARAGE_DOOR_CLOSING 3
+#define GARAGE_DOOR_CLOSED 4
+#define GARAGE_DOOR_STALLED 5
+#define GARAGE_DOOR_FAILED -1
+static int garage_door_state = GARAGE_DOOR_STALLED;
+static int garage_door_prev_state = GARAGE_DOOR_STALLED;
+static int garage_door_seconds_since_last_certain_state = 0;
+#define GARAGE_DOOR_MAX_MOVE_TIME 25 // how many periods (CONFIG_GPIO_POLL_FREQUENCY_SECONDS) has to pass
 
 K_SEM_DEFINE(lte_connected, 0, 1);
 struct modem_param_info modem_param;
 
 static char recv_buf[RECV_BUF_SIZE];
 
-/* 
+static void transmit_udp_data(char *data, size_t len)
+{
+	int err;
+	if (data != NULL)
+	{
+		printk("[INFO] Sending UDP payload, length: %u, data: %s\n", len, data);
+		err = send(client_fd, data, len, 0);
+		if (err == -ENOTCONN && server_reconnect())
+		{
+			err = send(client_fd, data, len, 0);
+		}
+
+		if (err < 0)
+		{
+			printk("[ERROR] Failed to transmit UDP packet, %d\n", errno);
+		}
+	}
+}
+
+/*
  * *** Static functions of main.c ***
  */
 static void fetch_sensor_data(void)
@@ -54,7 +94,7 @@ static void fetch_sensor_data(void)
 	sensor_channel_get(bme_680, SENSOR_CHAN_PRESS, &press);
 	sensor_channel_get(bme_680, SENSOR_CHAN_HUMIDITY, &humidity);
 	sensor_channel_get(bme_680, SENSOR_CHAN_GAS_RES, &gas_res);
-	
+
 	/* apply calibration offsets */
 	temp.val1 = temp.val1 - TEMP_CALIBRATION_OFFSET;
 
@@ -65,41 +105,112 @@ static void fetch_sensor_data(void)
 	// 	gas_res.val2);
 
 	/* format data, shrink factional part length of sensor_value to 2 digits */
-	temp.val2 = temp.val2/10000;
-	humidity.val2 = humidity.val2/10000;
+	temp.val2 = temp.val2 / 10000;
+	humidity.val2 = humidity.val2 / 10000;
 
 	/* convert pressure in Bar - sensor_value struct stores 2 integers (dec + fraction) */
-	pressure = (float)press.val1 + (float)press.val2/1000000; //reformat to float for conversion
-	pressure = pressure/100; //convert in Bar, but skip storing back into integer parts
+	pressure = (float)press.val1 + (float)press.val2 / 1000000; // reformat to float for conversion
+	pressure = pressure / 100;									// convert in Bar, but skip storing back into integer parts
 }
 
-static void transmit_udp_data(char *data, size_t len)
+static void fetch_gpio_data(void)
 {
-	int err;
-	if (data != NULL){
-		printk("Sending UDP payload, length: %u, data: %s\n", len, data);
-		err = send(client_fd, data, len, 0);
-		if (err < 0) {
-			printk("Failed to transmit UDP packet, %d\n", errno);
+	garage_door_prev_state = garage_door_state;
+
+	int open_endstop_state = gpio_pin_get(sx1509b_dev, GPIO_PIN_OPEN_ENDSTOP);
+	int closed_endstop_state = gpio_pin_get(sx1509b_dev, GPIO_PIN_CLOSED_ENDSTOP);
+
+	if (open_endstop_state < 0 || closed_endstop_state < 0)
+	{
+		printk("[ERROR] gpio_pin_get for sx1509b_dev failed\n");
+		garage_door_state = GARAGE_DOOR_FAILED;
+		return;
+	}
+
+	// printk("[DEBUG] open_endstop: %d, closed_endstop: %d\n",
+	//	   open_endstop_state, closed_endstop_state);
+
+	if (open_endstop_state == 1 && closed_endstop_state == 0)
+	{
+		garage_door_state = GARAGE_DOOR_OPEN;
+		garage_door_seconds_since_last_certain_state = 0;
+	}
+	else if (open_endstop_state == 0 && closed_endstop_state == 1)
+	{
+		garage_door_state = GARAGE_DOOR_CLOSED;
+		garage_door_seconds_since_last_certain_state = 0;
+	}
+	else if (open_endstop_state == 0 && closed_endstop_state == 0)
+	{
+		garage_door_seconds_since_last_certain_state += 1;
+		if (garage_door_seconds_since_last_certain_state > GARAGE_DOOR_MAX_MOVE_TIME)
+		{
+			garage_door_state = GARAGE_DOOR_STALLED;
+		}
+		else
+		{
+			if (garage_door_prev_state == GARAGE_DOOR_OPEN || garage_door_prev_state == GARAGE_DOOR_CLOSING)
+			{
+				garage_door_state = GARAGE_DOOR_CLOSING;
+			}
+			else if (garage_door_prev_state == GARAGE_DOOR_CLOSED || garage_door_prev_state == GARAGE_DOOR_OPENING)
+			{
+				garage_door_state = GARAGE_DOOR_OPENING;
+			}
 		}
 	}
+	else
+	{
+		// open and close at the same time - impossible
+		garage_door_state = GARAGE_DOOR_FAILED;
+	}
+
+	if (garage_door_state != garage_door_prev_state)
+	{
+		printk("[DEBUG] garage_door_state has changed from %d to %d\n",
+			   garage_door_prev_state, garage_door_state);
+
+		/* Transmit garage via UDP Socket  */
+		char data_output[128];
+		sprintf(data_output, "{\"Door\":%d}", garage_door_state);
+		transmit_udp_data(data_output, strlen(data_output));
+	}
+}
+
+static void click_garage_door_relay(void)
+{
+	printk("[DEBUG] garage door relay ON\n");
+	gpio_pin_set(sx1509b_dev, GPIO_PIN_RELAY, 1);
+	k_sleep(K_MSEC(500));
+	printk("[DEBUG] garage door relay OFF\n");
+	gpio_pin_set(sx1509b_dev, GPIO_PIN_RELAY, 0);
 }
 
 static int receive_udp_data(char *buf, int buf_size)
 {
 	int bytes;
 	bytes = recv(client_fd, buf, buf_size, 0);
-	if (bytes < 0) {
-		printk("recv() failed, err %d\n", errno);
+	if (bytes == -ENOTCONN && server_reconnect())
+	{
+		bytes = recv(client_fd, buf, buf_size, 0);
 	}
-	else if (bytes > 0) {
+
+	if (bytes < 0)
+	{
+		printk("[ERROR] recv() failed, err %d\n", errno);
+	}
+	else if (bytes > 0)
+	{
 		// Make sure buf is NULL terminated (for safe use)
-		if (bytes < buf_size) {
+		if (bytes < buf_size)
+		{
 			buf[bytes] = '\0';
-		} else {
+		}
+		else
+		{
 			buf[buf_size - 1] = '\0';
 		}
-		printk("Recived UDP data, length: %u, data: %s\n", bytes, buf);
+		printk("[DEBUG] Recived UDP data, length: %u, data: %s\n", bytes, buf);
 		return bytes;
 	}
 	return 0;
@@ -108,14 +219,14 @@ static int receive_udp_data(char *buf, int buf_size)
 /* Event Handler - used when pressing the button */
 static void ui_evt_handler(struct ui_evt evt)
 {
-	if (evt.type == 1){
-		if (socket_open){
+	if (evt.type == 1)
+	{
+		if (socket_open)
+		{
 			char data_output[128];
-			char imei[16];
-			modem_info_string_get(MODEM_INFO_IMEI, imei, sizeof(imei));
-			//sprintf(data_output, "{\"Msg\":\"Hello MWC 2022 from Thingy:91 IMEI %s\"}",imei);
-			sprintf(data_output, "{\"Msg\":\"Event: Thingy:91 button pressed, %s\"}",imei);
+			sprintf(data_output, "{\"Door\":%d,\"Btn\":1}", garage_door_state);
 			transmit_udp_data(data_output, strlen(data_output));
+			click_garage_door_relay();
 		}
 	}
 }
@@ -123,18 +234,33 @@ static void ui_evt_handler(struct ui_evt evt)
 /* Event Handler - used when data received via UDP */
 static void udp_evt_handler(char *buf)
 {
-	printk("Handling UDP data, data: %s\n", buf);
+	printk("[DEBUG] Handling UDP data, data: %s\n", buf);
 
-	int err = 0;
-	if (strcmp(buf, "buzzer-on") == 0) {
-		err = ui_buzzer_set_frequency(3000, 50);
+	if (strcmp(buf, "garage-door-open") == 0)
+	{
+		if (garage_door_state == GARAGE_DOOR_CLOSED)
+		{
+			click_garage_door_relay();
+		}
+		else
+		{
+			printk("[WARN] Ignoring the open action because the garage door is not closed\n");
+		}
 	}
-	else if (strcmp(buf, "buzzer-off") == 0)	{
-		err = ui_buzzer_set_frequency(0, 0);
+	else if (strcmp(buf, "garage-door-close") == 0)
+	{
+		if (garage_door_state == GARAGE_DOOR_OPEN)
+		{
+			click_garage_door_relay();
+		}
+		else
+		{
+			printk("[WARN] Ignoring the close action because the garage door is not open\n");
+		}
 	}
-
-	if (err < 0) {
-		printk("Failed to start the buzzer, %d\n", err);
+	else if (strcmp(buf, "garage-door-click") == 0)
+	{
+		click_garage_door_relay();
 	}
 }
 
@@ -148,6 +274,44 @@ static void data_fetch_work_fn(struct k_work *work)
 	k_work_schedule(&data_fetch_work, K_SECONDS(CONFIG_UDP_DATA_UPLOAD_FREQUENCY_SECONDS));
 }
 
+static void data_poll_work_fn(struct k_work *work)
+{
+	if (socket_open)
+	{
+		struct pollfd fds[1];
+		int ret = 0;
+
+		fds[0].fd = client_fd;
+		fds[0].events = POLLIN;
+		fds[0].revents = 0;
+
+		printk("[DEBUG] Polling UDP socket\n");
+		ret = poll(fds, 1, RCV_POLL_TIMEOUT_MS);
+		if (ret == -ENOTCONN && server_reconnect())
+		{
+			ret = poll(fds, 1, RCV_POLL_TIMEOUT_MS);
+		}
+
+		if (ret > 0)
+		{
+			int bytes;
+			bytes = receive_udp_data(recv_buf, RECV_BUF_SIZE);
+			if (bytes > 0)
+			{
+				udp_evt_handler(recv_buf);
+			}
+		}
+	}
+}
+
+static void gpio_fetch_work_fn(struct k_work *work)
+{
+	fetch_gpio_data();
+
+	/* Reschedule work task */
+	k_work_schedule(&gpio_fetch_work, K_SECONDS(CONFIG_GPIO_POLL_FREQUENCY_SECONDS));
+}
+
 static void initial_data_transmission(void)
 {
 	/* Get current modem parameters */
@@ -159,10 +323,11 @@ static void initial_data_transmission(void)
 	modem_info_string_get(MODEM_INFO_OPERATOR, operator, sizeof(operator));
 
 	/* format to JSON */
-	sprintf(data_output, "{\"Msg\":\"Event: Thingy:91 reconnected, %s, %s, %d\",\"Oper\":\"%s\",\"Bd\":%d}",
-		imei, operator, modem_param.network.current_band.value, operator, modem_param.network.current_band.value);
+	sprintf(data_output, "{\"Msg\":\"reconnected, %s, %s, %d\",\"Oper\":\"%s\",\"Bd\":%d}",
+			imei, operator, modem_param.network.current_band.value, operator, modem_param.network.current_band.value);
 	/* Transmit data via UDP Socket */
 	transmit_udp_data(data_output, strlen(data_output));
+	k_work_schedule(&data_poll_work, K_MSEC(500));
 }
 
 static void server_transmission_work_fn(struct k_work *work)
@@ -171,9 +336,10 @@ static void server_transmission_work_fn(struct k_work *work)
 	char data_output[128];
 
 	/* format to JSON */
-	sprintf(data_output,"{\"Temp\":%d.%02d,\"Press\":%.4f,\"Humid\":%d.%02d,\"Gas\":%d,\"Vbat\":%d}",
-		temp.val1, temp.val2, pressure,
-		humidity.val1, humidity.val2, gas_res.val1, modem_param.device.battery.value);
+	sprintf(data_output, "{\"Temp\":%d.%02d,\"Press\":%.4f,\"Humid\":%d.%02d,\"Gas\":%d,\"Vbat\":%d,\"Door\":%d}",
+			temp.val1, temp.val2, pressure,
+			humidity.val1, humidity.val2, gas_res.val1, modem_param.device.battery.value,
+			garage_door_state);
 
 	/* Transmit data via UDP Socket */
 	transmit_udp_data(data_output, strlen(data_output));
@@ -182,79 +348,68 @@ static void server_transmission_work_fn(struct k_work *work)
 	k_work_schedule(&server_transmission_work, K_SECONDS(CONFIG_UDP_DATA_UPLOAD_FREQUENCY_SECONDS));
 }
 
-static void poll_data_work_fn(struct k_work *work)
-{
-	if (socket_open){
-		struct pollfd fds[1];
-		int ret = 0;
-
-		fds[0].fd = client_fd;
-		fds[0].events = POLLIN;
-		fds[0].revents = 0;
-
-		ret = poll(fds, 1, RCV_POLL_TIMEOUT_MS);
-		if (ret > 0) {
-			int bytes;
-			bytes = receive_udp_data(recv_buf, RECV_BUF_SIZE);
-			if (bytes > 0) {
-				udp_evt_handler(recv_buf);
-			}
-		}
-	}
-	/* Reschedule work task */
-	k_work_schedule(&poll_data_work, K_SECONDS(CONFIG_UDP_DATA_DOWNLOAD_FREQUENCY_SECONDS));
-}
-
 static void work_init(void)
 {
 	k_work_init_delayable(&server_transmission_work, server_transmission_work_fn);
 	k_work_init_delayable(&data_fetch_work, data_fetch_work_fn);
-	k_work_init_delayable(&poll_data_work, poll_data_work_fn);
+	k_work_init_delayable(&data_poll_work, data_poll_work_fn);
+	k_work_init_delayable(&gpio_fetch_work, gpio_fetch_work_fn);
 }
 
 #if defined(CONFIG_NRF_MODEM_LIB)
 static void lte_handler(const struct lte_lc_evt *const evt)
 {
-	switch (evt->type) {
+	switch (evt->type)
+	{
 	case LTE_LC_EVT_NW_REG_STATUS:
 		if ((evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_HOME) &&
-		     (evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING)) {
-			socket_open=false;
+			(evt->nw_reg_status != LTE_LC_NW_REG_REGISTERED_ROAMING))
+		{
+			socket_open = false;
 			ui_led_set_effect(UI_LTE_CONNECTING);
 			break;
 		}
 		printk("[LTE] Network registration status: %s\n",
-			evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ?
-			"Connected - home network" : "Connected - roaming");
+			   evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ? "Connected - home network" : "Connected - roaming");
 		k_sem_give(&lte_connected);
 		ui_led_set_effect(UI_LTE_CONNECTED);
 		break;
 	case LTE_LC_EVT_PSM_UPDATE:
 		printk("[LTE] PSM parameter update: TAU: %d, Active time: %d\n",
-			evt->psm_cfg.tau, evt->psm_cfg.active_time);
+			   evt->psm_cfg.tau, evt->psm_cfg.active_time);
 		break;
-	case LTE_LC_EVT_EDRX_UPDATE: {
+	case LTE_LC_EVT_EDRX_UPDATE:
+	{
 		char log_buf[60];
 		ssize_t len;
 
 		len = snprintf(log_buf, sizeof(log_buf),
-			       "[LTE] eDRX parameter update: eDRX: %f, PTW: %f\n",
-			       evt->edrx_cfg.edrx, evt->edrx_cfg.ptw);
-		if (len > 0) {
+					   "[LTE] eDRX parameter update: eDRX: %f, PTW: %f\n",
+					   evt->edrx_cfg.edrx, evt->edrx_cfg.ptw);
+		if (len > 0)
+		{
 			printk("%s\n", log_buf);
 		}
 		break;
 	}
 	case LTE_LC_EVT_RRC_UPDATE:
 		printk("[LTE] RRC mode: %s\n",
-			evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ?
-			"Connected" : "Idle");
+			   evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED ? "Connected" : "Idle");
+
+		if (evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED)
+		{
+			k_work_schedule(&data_poll_work, K_MSEC(500));
+		}
 		break;
 	case LTE_LC_EVT_CELL_UPDATE:
 		printk("[LTE] LTE cell changed: Cell ID: %d, Tracking area: %d\n",
-		       evt->cell.id, evt->cell.tac);
+			   evt->cell.id, evt->cell.tac);
 		break;
+	case LTE_LC_EVT_LTE_MODE_UPDATE:
+		printk("[LTE] LTE mode: %s\n",
+			   evt->lte_mode == LTE_LC_LTE_MODE_LTEM ? "LTE-M" : "NB-IoT");
 	default:
+		// printk("[DEBUG] unknown event type: %d\n", evt->type);
 		break;
 	}
 }
@@ -266,34 +421,39 @@ static int configure_low_power(void)
 #if defined(CONFIG_UDP_PSM_ENABLE)
 	/** Power Saving Mode */
 	err = lte_lc_psm_req(true);
-	if (err) {
-		printk("lte_lc_psm_req, error: %d\n", err);
+	if (err)
+	{
+		printk("[ERROR] lte_lc_psm_req, error: %d\n", err);
 	}
 #else
 	err = lte_lc_psm_req(false);
-	if (err) {
-		printk("lte_lc_psm_req, error: %d\n", err);
+	if (err)
+	{
+		printk("[ERROR] lte_lc_psm_req, error: %d\n", err);
 	}
 #endif
 
 #if defined(CONFIG_UDP_EDRX_ENABLE)
 	/** enhanced Discontinuous Reception */
 	err = lte_lc_edrx_req(true);
-	if (err) {
-		printk("lte_lc_edrx_req, error: %d\n", err);
+	if (err)
+	{
+		printk("[ERROR] lte_lc_edrx_req, error: %d\n", err);
 	}
 #else
 	err = lte_lc_edrx_req(false);
-	if (err) {
-		printk("lte_lc_edrx_req, error: %d\n", err);
+	if (err)
+	{
+		printk("[ERROR] lte_lc_edrx_req, error: %d\n", err);
 	}
 #endif
 
 #if defined(CONFIG_UDP_RAI_ENABLE)
 	/** Release Assistance Indication  */
 	err = lte_lc_rai_req(true);
-	if (err) {
-		printk("lte_lc_rai_req, error: %d\n", err);
+	if (err)
+	{
+		printk("[ERROR] lte_lc_rai_req, error: %d\n", err);
 	}
 #endif
 
@@ -305,12 +465,16 @@ static void modem_init(void)
 	int err;
 	char response[128];
 
-	if (IS_ENABLED(CONFIG_LTE_AUTO_INIT_AND_CONNECT)) {
+	if (IS_ENABLED(CONFIG_LTE_AUTO_INIT_AND_CONNECT))
+	{
 		/* Do nothing, modem is already configured and LTE connected. */
-	} else {
+	}
+	else
+	{
 		err = lte_lc_init();
-		if (err) {
-			printk("Modem initialization failed, error: %d\n", err);
+		if (err)
+		{
+			printk("[ERROR] Modem initialization failed, error: %d\n", err);
 			return;
 		}
 
@@ -319,29 +483,36 @@ static void modem_init(void)
 		/* Read out Modem IMEI */
 		printk("[INFO] Read Modem IMEI\n");
 		err = nrf_modem_at_cmd(response, sizeof(response), "AT+CGSN=%d", 1);
-		if (err) {
-			printk("Read Modem IMEI failed, err %d\n", err);
+		if (err)
+		{
+			printk("[ERROR] Read Modem IMEI failed, err %d\n", err);
 			return;
-		}else{
-			printk("[AT] %s", response);
+		}
+		else
+		{
+			printk("[AT] %s\n", response);
 		}
 
 		/* Setup APN for the PDP Context */
 		printk("[INFO] Setting up the APN\n");
 		char *apn_stat = "AT%XAPNSTATUS=1,\"" MODEM_APN "\"";
 		char *at_cgdcont = "AT+CGDCONT=0,\"IPV4V6\",\"" MODEM_APN "\"";
-		nrf_modem_at_printf(apn_stat); // allow use of APN
+		nrf_modem_at_printf(apn_stat);		   // allow use of APN
 		err = nrf_modem_at_printf(at_cgdcont); // use conf. APN for PDP context 0 (default LTE bearer)
-		if (err) {
-			printk("AT+CGDCONT set cmd failed, err %d\n", err);
+		if (err)
+		{
+			printk("[ERROR] AT+CGDCONT set cmd failed, err %d\n", err);
 			return;
 		}
 		err = nrf_modem_at_cmd(response, sizeof(response), "AT+CGDCONT?", NULL);
-		if (err) {
-			printk("APN check failed, err %d\n", err);
+		if (err)
+		{
+			printk("[ERROR] APN check failed, err %d\n", err);
 			return;
-		}else{
-			printk("[AT] %s", response);
+		}
+		else
+		{
+			printk("[AT] %s\n", response);
 		}
 		/* Init modem info module */
 		modem_info_init();
@@ -353,13 +524,17 @@ static void modem_connect(void)
 {
 	int err;
 
-	if (IS_ENABLED(CONFIG_LTE_AUTO_INIT_AND_CONNECT)) {
+	if (IS_ENABLED(CONFIG_LTE_AUTO_INIT_AND_CONNECT))
+	{
 		/* Do nothing, modem is already configured and LTE connected. */
-	} else {
+	}
+	else
+	{
 		err = lte_lc_connect_async(lte_handler);
-		if (err) {
-			printk("Connecting to LTE network failed, error: %d\n",
-			       err);
+		if (err)
+		{
+			printk("[ERROR] Connecting to LTE network failed, error: %d\n",
+				   err);
 			return;
 		}
 	}
@@ -368,6 +543,7 @@ static void modem_connect(void)
 
 static void server_disconnect(void)
 {
+	socket_open = false;
 	(void)close(client_fd);
 }
 
@@ -379,7 +555,7 @@ static int server_init(void)
 	server4->sin_port = htons(CONFIG_UDP_SERVER_PORT);
 
 	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC,
-		  &server4->sin_addr);
+			  &server4->sin_addr);
 
 	return 0;
 }
@@ -389,16 +565,18 @@ static int server_connect(void)
 	int err;
 
 	client_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (client_fd < 0) {
-		printk("Failed to create UDP socket: %d\n", errno);
+	if (client_fd < 0)
+	{
+		printk("[ERROR] Failed to create UDP socket: %d\n", errno);
 		err = -errno;
 		goto error;
 	}
 
 	err = connect(client_fd, (struct sockaddr *)&host_addr,
-		      sizeof(struct sockaddr_in));
-	if (err < 0) {
-		printk("Connect failed : %d\n", errno);
+				  sizeof(struct sockaddr_in));
+	if (err < 0)
+	{
+		printk("[ERROR] Connect failed : %d\n", errno);
 		goto error;
 	}
 	socket_open = true;
@@ -410,19 +588,51 @@ error:
 	return err;
 }
 
-/* 
+static bool server_reconnect(void)
+{
+	printk("[INFO] Reconnecting to UDP server\n");
+	server_disconnect();
+
+	err = server_connect();
+	if (err)
+	{
+		printk("[ERROR] Not able to reconnect to UDP server\n");
+		return false;
+	}
+	return true;
+}
+
+/*
  * *** Main Applicatin Entry ***
  */
 void main(void)
 {
 	int err;
 
-	printk("\n*** IoT Creators Demo Application started ***\n");
+	// some dalay so that we can connect with serial port and read debugging messages from the start
+	k_sleep(K_SECONDS(5));
+
+	printk("\n*** Garage Door ***\n");
 
 	/* Init routines */
 	ui_init(ui_evt_handler);
 	ui_led_set_effect(UI_LTE_CONNECTING);
 	bme_680 = device_get_binding(DT_LABEL(DT_INST(0, bosch_bme680)));
+
+	sx1509b_dev = device_get_binding(DT_LABEL(DT_INST(0, semtech_sx1509b)));
+
+	if (!device_is_ready(sx1509b_dev))
+	{
+		printk("[ERROR] sx1509b device is not ready\n");
+		return;
+	}
+
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_OPEN_ENDSTOP, GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_CLOSED_ENDSTOP, GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_RELAY, GPIO_OUTPUT_LOW);
+
+	k_sleep(K_MSEC(1)); /* Wait for the i2c rail to come up and stabilize */
+
 	work_init();
 
 	/* Initialize the modem before calling configure_low_power(). This is
@@ -431,8 +641,9 @@ void main(void)
 	 */
 	modem_init();
 	err = configure_low_power();
-	if (err) {
-		printk("Unable to set low power configuration, error: %d\n",err);
+	if (err)
+	{
+		printk("[ERROR] Unable to set low power configuration, error: %d\n", err);
 	}
 
 	modem_connect();
@@ -441,21 +652,23 @@ void main(void)
 
 	/* Init UDP Socket */
 	err = server_init();
-	if (err) {
-		printk("Not able to initialize UDP server connection\n");
+	if (err)
+	{
+		printk("[ERROR] Not able to initialize UDP server connection\n");
 		return;
 	}
 
 	/* Connect UDP Socket */
 	err = server_connect();
-	if (err) {
-		printk("Not able to connect to UDP server\n");
+	if (err)
+	{
+		printk("[ERROR] Not able to connect to UDP server\n");
 		return;
 	}
 
 	/* Perform initial data transmission & schedule periodic tasks */
 	initial_data_transmission();
 	k_work_schedule(&data_fetch_work, K_NO_WAIT);
-	k_work_schedule(&server_transmission_work, K_SECONDS(2));	
-	k_work_schedule(&poll_data_work, K_SECONDS(3));
+	k_work_schedule(&gpio_fetch_work, K_NO_WAIT);
+	k_work_schedule(&server_transmission_work, K_SECONDS(2));
 }
