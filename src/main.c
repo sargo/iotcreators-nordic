@@ -65,6 +65,67 @@ struct modem_param_info modem_param;
 
 static char recv_buf[RECV_BUF_SIZE];
 
+static int server_init(void)
+{
+	struct sockaddr_in *server4 = ((struct sockaddr_in *)&host_addr);
+
+	server4->sin_family = AF_INET;
+	server4->sin_port = htons(CONFIG_UDP_SERVER_PORT);
+
+	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC,
+			  &server4->sin_addr);
+
+	return 0;
+}
+
+static void server_disconnect(void)
+{
+	socket_open = false;
+	(void)close(client_fd);
+}
+
+static int server_connect(void)
+{
+	int err;
+
+	client_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (client_fd < 0)
+	{
+		printk("[ERROR] Failed to create UDP socket: %d\n", errno);
+		err = -errno;
+		goto error;
+	}
+
+	err = connect(client_fd, (struct sockaddr *)&host_addr,
+				  sizeof(struct sockaddr_in));
+	if (err < 0)
+	{
+		printk("[ERROR] Connect failed : %d\n", errno);
+		goto error;
+	}
+	socket_open = true;
+	return 0;
+
+error:
+	server_disconnect();
+
+	return err;
+}
+
+static bool server_reconnect(void)
+{
+	printk("[INFO] Reconnecting to UDP server\n");
+	server_disconnect();
+
+	int err = server_connect();
+	if (err)
+	{
+		printk("[ERROR] Not able to reconnect to UDP server\n");
+		return false;
+	}
+	return true;
+}
+
 static void transmit_udp_data(char *data, size_t len)
 {
 	int err;
@@ -541,66 +602,6 @@ static void modem_connect(void)
 }
 #endif
 
-static void server_disconnect(void)
-{
-	socket_open = false;
-	(void)close(client_fd);
-}
-
-static int server_init(void)
-{
-	struct sockaddr_in *server4 = ((struct sockaddr_in *)&host_addr);
-
-	server4->sin_family = AF_INET;
-	server4->sin_port = htons(CONFIG_UDP_SERVER_PORT);
-
-	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC,
-			  &server4->sin_addr);
-
-	return 0;
-}
-
-static int server_connect(void)
-{
-	int err;
-
-	client_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (client_fd < 0)
-	{
-		printk("[ERROR] Failed to create UDP socket: %d\n", errno);
-		err = -errno;
-		goto error;
-	}
-
-	err = connect(client_fd, (struct sockaddr *)&host_addr,
-				  sizeof(struct sockaddr_in));
-	if (err < 0)
-	{
-		printk("[ERROR] Connect failed : %d\n", errno);
-		goto error;
-	}
-	socket_open = true;
-	return 0;
-
-error:
-	server_disconnect();
-
-	return err;
-}
-
-static bool server_reconnect(void)
-{
-	printk("[INFO] Reconnecting to UDP server\n");
-	server_disconnect();
-
-	err = server_connect();
-	if (err)
-	{
-		printk("[ERROR] Not able to reconnect to UDP server\n");
-		return false;
-	}
-	return true;
-}
 
 /*
  * *** Main Applicatin Entry ***
