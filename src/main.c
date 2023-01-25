@@ -66,7 +66,7 @@ static int garage_door_seconds_since_last_certain_state = 0;
 #define GARAGE_DOOR_MAX_MOVE_TIME 25 // how many periods (CONFIG_GPIO_POLL_FREQUENCY_SECONDS) has to pass
 
 /* Car presence */
-#define CAR_PRESENCE_TRESHOLD 50
+#define CAR_PRESENCE_TRESHOLD 120
 #define CAR_PRESENCE_YES 1
 #define CAR_PRESENCE_NO 0
 #define CAR_PRESENCE_FAILED -1
