@@ -44,7 +44,7 @@ struct led_effect {
 
 #define LED_EFFECT_LED_ON(_color)					       \
 	{								       \
-		.steps = ((const struct led_effect_step[]) {		       \
+		.steps = ((struct led_effect_step[]) {		       \
 			{						       \
 				.color = _color,			       \
 				.substep_count = 1,			       \

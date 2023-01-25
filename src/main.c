@@ -13,6 +13,7 @@
 #include <device.h>			  // Zephyr device API
 #include <drivers/sensor.h>	  // Zephyr sensor driver API
 #include <drivers/gpio.h>
+#include <sys_clock.h>
 
 /* UI drivers for Thingy:91 */
 #include "buzzer.h"
@@ -37,6 +38,10 @@ const struct device *sx1509b_dev;
 #define GPIO_PIN_CLOSED_ENDSTOP 14
 #define GPIO_PIN_RELAY 13
 
+/* Ultrasonic */
+#define GPIO_PIN_ULTRASONIC_TRIG 12
+#define GPIO_PIN_ULTRASONIC_ECHO 11
+
 /* UDP Socket */
 static int client_fd;
 static bool socket_open = false;
@@ -59,6 +64,14 @@ static int garage_door_state = GARAGE_DOOR_STALLED;
 static int garage_door_prev_state = GARAGE_DOOR_STALLED;
 static int garage_door_seconds_since_last_certain_state = 0;
 #define GARAGE_DOOR_MAX_MOVE_TIME 25 // how many periods (CONFIG_GPIO_POLL_FREQUENCY_SECONDS) has to pass
+
+/* Car presence */
+#define CAR_PRESENCE_TRESHOLD 50
+#define CAR_PRESENCE_YES 1
+#define CAR_PRESENCE_NO 0
+#define CAR_PRESENCE_FAILED -1
+static int car_presence_state = CAR_PRESENCE_FAILED;
+static int car_presence_prev_state = CAR_PRESENCE_FAILED;
 
 K_SEM_DEFINE(lte_connected, 0, 1);
 struct modem_param_info modem_param;
@@ -172,6 +185,62 @@ static void fetch_sensor_data(void)
 	/* convert pressure in Bar - sensor_value struct stores 2 integers (dec + fraction) */
 	pressure = (float)press.val1 + (float)press.val2 / 1000000; // reformat to float for conversion
 	pressure = pressure / 100;									// convert in Bar, but skip storing back into integer parts
+}
+
+static void fetch_ultrasonic_data(void)
+{
+	uint32_t cycles_spent;
+	uint32_t val;
+	uint32_t stop_time;
+	uint32_t start_time;
+	uint32_t iter = 0;
+	int distance;
+
+	car_presence_prev_state = car_presence_state;
+
+	gpio_pin_set(sx1509b_dev, GPIO_PIN_ULTRASONIC_TRIG, 1);
+	k_sleep(K_MSEC(10));
+	gpio_pin_set(sx1509b_dev, GPIO_PIN_ULTRASONIC_TRIG, 0);
+
+	do
+	{
+		iter++;
+		val = gpio_pin_get(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO);
+	} while (val == 0 && iter < 1000);
+
+	if (iter >= 1000)
+	{
+		printk("[ERROR] No reponse from HC-SR04\n");
+		car_presence_state = CAR_PRESENCE_FAILED;
+		return;
+	}
+
+	start_time = k_cycle_get_32();
+
+	do
+	{
+		val = gpio_pin_get(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO);
+		stop_time = k_cycle_get_32();
+		cycles_spent = stop_time - start_time;
+		if (cycles_spent > 1266720) // 260cm for 84MHz (((MAX_RANGE * 58000) / 1000000000) * (CLOCK * 1000000))
+		{
+			break;
+		}
+	} while (val == 1);
+
+	distance = SYS_CLOCK_HW_CYCLES_TO_NS_AVG(cycles_spent, 58000); // in centimeters
+	car_presence_state = distance > CAR_PRESENCE_TRESHOLD ? CAR_PRESENCE_NO : CAR_PRESENCE_YES;
+
+	if (car_presence_state != car_presence_prev_state)
+	{
+		printk("[DEBUG] car_presence_state has changed from %d to %d (distance=%d)\n",
+			   car_presence_prev_state, car_presence_state, distance);
+
+		/* Transmit garage via UDP Socket  */
+		char data_output[128];
+		sprintf(data_output, "{\"Car\":%d}", car_presence_state);
+		transmit_udp_data(data_output, strlen(data_output));
+	}
 }
 
 static void fetch_gpio_data(void)
@@ -368,6 +437,7 @@ static void data_poll_work_fn(struct k_work *work)
 static void gpio_fetch_work_fn(struct k_work *work)
 {
 	fetch_gpio_data();
+	fetch_ultrasonic_data();
 
 	/* Reschedule work task */
 	k_work_schedule(&gpio_fetch_work, K_SECONDS(CONFIG_GPIO_POLL_FREQUENCY_SECONDS));
@@ -397,10 +467,10 @@ static void server_transmission_work_fn(struct k_work *work)
 	char data_output[128];
 
 	/* format to JSON */
-	sprintf(data_output, "{\"Temp\":%d.%02d,\"Press\":%.4f,\"Humid\":%d.%02d,\"Gas\":%d,\"Vbat\":%d,\"Door\":%d}",
+	sprintf(data_output, "{\"Temp\":%d.%02d,\"Press\":%.4f,\"Humid\":%d.%02d,\"Gas\":%d,\"Vbat\":%d,\"Door\":%d,\"Car\":%d}",
 			temp.val1, temp.val2, pressure,
 			humidity.val1, humidity.val2, gas_res.val1, modem_param.device.battery.value,
-			garage_door_state);
+			garage_door_state, car_presence_state);
 
 	/* Transmit data via UDP Socket */
 	transmit_udp_data(data_output, strlen(data_output));
@@ -602,7 +672,6 @@ static void modem_connect(void)
 }
 #endif
 
-
 /*
  * *** Main Applicatin Entry ***
  */
@@ -631,6 +700,9 @@ void main(void)
 	gpio_pin_configure(sx1509b_dev, GPIO_PIN_OPEN_ENDSTOP, GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
 	gpio_pin_configure(sx1509b_dev, GPIO_PIN_CLOSED_ENDSTOP, GPIO_INPUT | GPIO_PULL_UP | GPIO_ACTIVE_LOW);
 	gpio_pin_configure(sx1509b_dev, GPIO_PIN_RELAY, GPIO_OUTPUT_LOW);
+
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_ULTRASONIC_TRIG, GPIO_OUTPUT);
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO, GPIO_INPUT | GPIO_ACTIVE_HIGH);
 
 	k_sleep(K_MSEC(1)); /* Wait for the i2c rail to come up and stabilize */
 
