@@ -75,7 +75,7 @@ struct led_effect {
 		.loop_forever = true,					       \
 	}
 
-#define _BREATH_SUBSTEPS 15
+#define _BREATH_SUBSTEPS 5
 #define _BREATH_PAUSE_SUBSTEPS 1
 #define LED_EFFECT_LED_BREATHE(_period, _pause, _color)			       \
 	{								       \

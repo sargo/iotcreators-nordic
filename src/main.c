@@ -44,6 +44,7 @@ const struct device *sx1509b_dev;
 
 /* UDP Socket */
 static int client_fd;
+static bool socket_init = false;
 static bool socket_open = false;
 static struct sockaddr_storage host_addr;
 
@@ -88,6 +89,7 @@ static int server_init(void)
 	inet_pton(AF_INET, CONFIG_UDP_SERVER_ADDRESS_STATIC,
 			  &server4->sin_addr);
 
+	socket_init = true;
 	return 0;
 }
 
@@ -104,6 +106,7 @@ static int server_connect(void)
 	client_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (client_fd < 0)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] Failed to create UDP socket: %d\n", errno);
 		err = -errno;
 		goto error;
@@ -113,6 +116,7 @@ static int server_connect(void)
 				  sizeof(struct sockaddr_in));
 	if (err < 0)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] Connect failed : %d\n", errno);
 		goto error;
 	}
@@ -133,6 +137,7 @@ static bool server_reconnect(void)
 	int err = server_connect();
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] Not able to reconnect to UDP server\n");
 		return false;
 	}
@@ -153,6 +158,7 @@ static void transmit_udp_data(char *data, size_t len)
 
 		if (err < 0)
 		{
+			ui_led_set_effect(UI_LED_ERROR_CLOUD);
 			printk("[ERROR] Failed to transmit UDP packet, %d\n", errno);
 		}
 	}
@@ -210,6 +216,7 @@ static void fetch_ultrasonic_data(void)
 
 	if (iter >= 1000)
 	{
+		ui_led_set_effect(UI_LED_ERROR_UNKNOWN);
 		printk("[ERROR] No reponse from HC-SR04\n");
 		car_presence_state = CAR_PRESENCE_FAILED;
 		return;
@@ -222,9 +229,12 @@ static void fetch_ultrasonic_data(void)
 		val = gpio_pin_get(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO);
 		stop_time = k_cycle_get_32();
 		cycles_spent = stop_time - start_time;
-		if (cycles_spent > 1266720) // 260cm for 84MHz (((MAX_RANGE * 58000) / 1000000000) * (CLOCK * 1000000))
+		if (cycles_spent > 5000)
 		{
-			break;
+			ui_led_set_effect(UI_LED_ERROR_UNKNOWN);
+			printk("[ERROR] No reponse from HC-SR04\n");
+			car_presence_state = CAR_PRESENCE_FAILED;
+			return;
 		}
 	} while (val == 1);
 
@@ -252,6 +262,7 @@ static void fetch_gpio_data(void)
 
 	if (open_endstop_state < 0 || closed_endstop_state < 0)
 	{
+		ui_led_set_effect(UI_LED_ERROR_UNKNOWN);
 		printk("[ERROR] gpio_pin_get for sx1509b_dev failed\n");
 		garage_door_state = GARAGE_DOOR_FAILED;
 		return;
@@ -327,6 +338,7 @@ static int receive_udp_data(char *buf, int buf_size)
 
 	if (bytes < 0)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] recv() failed, err %d\n", errno);
 	}
 	else if (bytes > 0)
@@ -504,6 +516,10 @@ static void lte_handler(const struct lte_lc_evt *const evt)
 			   evt->nw_reg_status == LTE_LC_NW_REG_REGISTERED_HOME ? "Connected - home network" : "Connected - roaming");
 		k_sem_give(&lte_connected);
 		ui_led_set_effect(UI_LTE_CONNECTED);
+		if (socket_init && !socket_open)
+		{
+			server_reconnect();
+		}
 		break;
 	case LTE_LC_EVT_PSM_UPDATE:
 		printk("[LTE] PSM parameter update: TAU: %d, Active time: %d\n",
@@ -554,12 +570,14 @@ static int configure_low_power(void)
 	err = lte_lc_psm_req(true);
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] lte_lc_psm_req, error: %d\n", err);
 	}
 #else
 	err = lte_lc_psm_req(false);
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] lte_lc_psm_req, error: %d\n", err);
 	}
 #endif
@@ -569,12 +587,14 @@ static int configure_low_power(void)
 	err = lte_lc_edrx_req(true);
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] lte_lc_edrx_req, error: %d\n", err);
 	}
 #else
 	err = lte_lc_edrx_req(false);
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] lte_lc_edrx_req, error: %d\n", err);
 	}
 #endif
@@ -584,6 +604,7 @@ static int configure_low_power(void)
 	err = lte_lc_rai_req(true);
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] lte_lc_rai_req, error: %d\n", err);
 	}
 #endif
@@ -605,6 +626,7 @@ static void modem_init(void)
 		err = lte_lc_init();
 		if (err)
 		{
+			ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 			printk("[ERROR] Modem initialization failed, error: %d\n", err);
 			return;
 		}
@@ -616,6 +638,7 @@ static void modem_init(void)
 		err = nrf_modem_at_cmd(response, sizeof(response), "AT+CGSN=%d", 1);
 		if (err)
 		{
+			ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 			printk("[ERROR] Read Modem IMEI failed, err %d\n", err);
 			return;
 		}
@@ -632,12 +655,14 @@ static void modem_init(void)
 		err = nrf_modem_at_printf(at_cgdcont); // use conf. APN for PDP context 0 (default LTE bearer)
 		if (err)
 		{
+			ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 			printk("[ERROR] AT+CGDCONT set cmd failed, err %d\n", err);
 			return;
 		}
 		err = nrf_modem_at_cmd(response, sizeof(response), "AT+CGDCONT?", NULL);
 		if (err)
 		{
+			ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 			printk("[ERROR] APN check failed, err %d\n", err);
 			return;
 		}
@@ -664,6 +689,7 @@ static void modem_connect(void)
 		err = lte_lc_connect_async(lte_handler);
 		if (err)
 		{
+			ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 			printk("[ERROR] Connecting to LTE network failed, error: %d\n",
 				   err);
 			return;
@@ -693,6 +719,7 @@ void main(void)
 
 	if (!device_is_ready(sx1509b_dev))
 	{
+		ui_led_set_effect(UI_LED_ERROR_UNKNOWN);
 		printk("[ERROR] sx1509b device is not ready\n");
 		return;
 	}
@@ -702,7 +729,7 @@ void main(void)
 	gpio_pin_configure(sx1509b_dev, GPIO_PIN_RELAY, GPIO_OUTPUT_LOW);
 
 	gpio_pin_configure(sx1509b_dev, GPIO_PIN_ULTRASONIC_TRIG, GPIO_OUTPUT);
-	gpio_pin_configure(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO, GPIO_INPUT | GPIO_ACTIVE_HIGH);
+	gpio_pin_configure(sx1509b_dev, GPIO_PIN_ULTRASONIC_ECHO, GPIO_INPUT | GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH);
 
 	k_sleep(K_MSEC(1)); /* Wait for the i2c rail to come up and stabilize */
 
@@ -716,6 +743,7 @@ void main(void)
 	err = configure_low_power();
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_LTE_LC);
 		printk("[ERROR] Unable to set low power configuration, error: %d\n", err);
 	}
 
@@ -727,6 +755,7 @@ void main(void)
 	err = server_init();
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] Not able to initialize UDP server connection\n");
 		return;
 	}
@@ -735,6 +764,7 @@ void main(void)
 	err = server_connect();
 	if (err)
 	{
+		ui_led_set_effect(UI_LED_ERROR_CLOUD);
 		printk("[ERROR] Not able to connect to UDP server\n");
 		return;
 	}
